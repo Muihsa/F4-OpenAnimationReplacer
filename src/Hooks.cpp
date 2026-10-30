@@ -9824,8 +9824,9 @@ namespace
 						for (const auto& cond : cs->GetConditions()) {
 							if (!cond) continue;
 							std::string prefix = cond->IsNegated() ? "NOT " : "";
-							std::string evalStr = cond->lastEvalResult.has_value()
-								? (cond->lastEvalResult.value() ? "PASS" : "FAIL") : "?";
+							auto lastEvalResult = cond->GetLastEvalResult(refr, a_this);
+							std::string evalStr = lastEvalResult.has_value()
+								? (lastEvalResult.value() ? "PASS" : "FAIL") : "?";
 							OAR_VLOG("[OAR-CondDetail]     {}{} [{}] -> {}",
 								prefix, cond->GetName(), cond->GetParameterString(), evalStr);
 						}

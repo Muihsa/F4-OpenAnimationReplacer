@@ -1487,8 +1487,9 @@ void UIMain::DrawCondition(ICondition* a_condition, ConditionSet* a_parentSet, i
 	bool editable = currentMode != UICommon::EditorMode::kInspect;
 	bool isNegated = a_condition->IsNegated();
 	bool isDisabled = a_condition->IsDisabled();
-	bool hasValue = a_condition->lastEvalResult.has_value();
-	bool evalResult = a_condition->lastEvalResult.value_or(false);
+	auto lastEvalResult = a_condition->GetLastPlayerEvalResult();
+	bool hasValue = lastEvalResult.has_value();
+	bool evalResult = lastEvalResult.value_or(false);
 
 	// Every composite condition type that owns a child ConditionSet. XOR and
 	// the TARGET/PLAYER context wrappers were missing here — their children

@@ -61,7 +61,30 @@ public:
 	bool IsNegated() const { return negated; }
 	void SetNegated(bool a_val) { negated = a_val; }
 
-	mutable std::optional<bool> lastEvalResult;
+	void RecordLastEvalResult(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator* a_clipGen, bool a_result) const;
+	std::optional<bool> GetLastEvalResult(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator* a_clipGen) const;
+	std::optional<bool> GetLastPlayerEvalResult() const;
+
+private:
+	struct EvaluationKey
+	{
+		uint32_t actorFormID{ 0 };
+		const RE::hkbClipGenerator* clipGenerator{ nullptr };
+		bool operator==(const EvaluationKey&) const = default;
+	};
+	struct EvaluationKeyHash
+	{
+		size_t operator()(const EvaluationKey& a_key) const;
+	};
+	struct EvaluationResult
+	{
+		bool value{ false };
+		uint64_t sequence{ 0 };
+	};
+
+	mutable std::shared_mutex evalResultsMutex;
+	mutable std::unordered_map<EvaluationKey, EvaluationResult, EvaluationKeyHash> evalResults;
+	mutable uint64_t nextEvalSequence{ 0 };
 
 protected:
 	bool disabled{ false };
@@ -74,13 +97,13 @@ public:
 	bool Evaluate(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator* a_clipGen, const SubMod* a_parentSubMod) const override final
 	{
 		if (disabled) {
-			lastEvalResult = true;
+			RecordLastEvalResult(a_refr, a_clipGen, true);
 			return true;
 		}
 
 		bool result = EvaluateImpl(a_refr, a_clipGen, a_parentSubMod);
 		if (negated) result = !result;
-		lastEvalResult = result;
+		RecordLastEvalResult(a_refr, a_clipGen, result);
 		return result;
 	}
 
