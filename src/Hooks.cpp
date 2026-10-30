@@ -15081,20 +15081,31 @@ namespace Hooks
 	namespace ActionFireEmptyHook
 	{
 		using NotifyFn = bool(*)(RE::IAnimationGraphManagerHolder*, const RE::BSFixedString&);
-		static NotifyFn _OriginalNotify = nullptr;
+
+		// One original per vtable. Actor and PlayerCharacter each own a copy of the
+		// IAnimationGraphManagerHolder vtable, and BOTH may have been patched by
+		// another plugin before us (Modern Weapon Behavior hooks the PlayerCharacter
+		// copy). The value displaced from each table is that table's chain target —
+		// substituting the Actor table's original for the player's would silently
+		// unhook whoever was there and dead-wire their whole event path.
+		static NotifyFn _OriginalActorNotify = nullptr;
+		static NotifyFn _OriginalPlayerNotify = nullptr;
 
 		// SEH wrapper must live in its own function — MSVC forbids __try in the
 		// same function as C++ objects with destructors (unique_lock below).
-		static bool CallOriginalNotifySEH(RE::IAnimationGraphManagerHolder* a_this, const RE::BSFixedString& a_eventName)
+		static bool CallOriginalNotifySEH(NotifyFn a_original, RE::IAnimationGraphManagerHolder* a_this,
+			const RE::BSFixedString& a_eventName)
 		{
+			if (!a_original) return false;
 			__try {
-				return _OriginalNotify(a_this, a_eventName);
+				return a_original(a_this, a_eventName);
 			} __except (EXCEPTION_EXECUTE_HANDLER) {
 				return false;
 			}
 		}
 
-		static bool HookedNotifyAnimGraph(RE::IAnimationGraphManagerHolder* a_this, const RE::BSFixedString& a_eventName)
+		static bool HookedNotifyAnimGraphImpl(RE::IAnimationGraphManagerHolder* a_this,
+			const RE::BSFixedString& a_eventName, NotifyFn a_original)
 		{
 			// Check if this is ActionFireEmpty
 			const char* evtStr = a_eventName.c_str();
@@ -15116,28 +15127,48 @@ namespace Hooks
 			// Depth wraps the original call so any clip Update/Activate that runs
 			// as a consequence of this notify sees s_notifyAnimGraphDepth > 0.
 			++s_notifyAnimGraphDepth;
-			const bool result = CallOriginalNotifySEH(a_this, a_eventName);
+			const bool result = CallOriginalNotifySEH(a_original, a_this, a_eventName);
 			--s_notifyAnimGraphDepth;
 			return result;
 		}
 
+		static bool HookedActorNotifyAnimGraph(RE::IAnimationGraphManagerHolder* a_this, const RE::BSFixedString& a_eventName)
+		{
+			return HookedNotifyAnimGraphImpl(a_this, a_eventName, _OriginalActorNotify);
+		}
+
+		static bool HookedPlayerNotifyAnimGraph(RE::IAnimationGraphManagerHolder* a_this, const RE::BSFixedString& a_eventName)
+		{
+			return HookedNotifyAnimGraphImpl(a_this, a_eventName, _OriginalPlayerNotify);
+		}
+
 		void Install()
 		{
-			// Actor IAnimationGraphManagerHolder vtable = Actor VTABLE array index 5
+			// Idempotent: a second Install must never chain a table to its own thunk
+			// (that would recurse forever on the next event).
 			REL::Relocation<uintptr_t> actorAnimGraphVtbl{ REL::ID(453840) };
-			_OriginalNotify = reinterpret_cast<NotifyFn>(
-				actorAnimGraphVtbl.write_vfunc(1, &HookedNotifyAnimGraph));
+			auto* actorSlot = reinterpret_cast<NotifyFn*>(actorAnimGraphVtbl.address() + sizeof(void*));
+			if (*actorSlot != &HookedActorNotifyAnimGraph) {
+				_OriginalActorNotify = reinterpret_cast<NotifyFn>(
+					actorAnimGraphVtbl.write_vfunc(1, &HookedActorNotifyAnimGraph));
+			}
 
 			// PlayerCharacter has its own copy of that interface vtable (array index 5).
 			// Hook it too so player-side notifies (the crash path) update the depth.
+			// Chain through whatever was installed in THIS table — plugins that load
+			// before us (alphabetical F4SE order) hold their thunk here.
 			REL::Relocation<uintptr_t> playerAnimGraphVtbl{ REL::ID(1276847) };
-			auto* playerPrev = reinterpret_cast<NotifyFn>(
-				playerAnimGraphVtbl.write_vfunc(1, &HookedNotifyAnimGraph));
-			if (playerPrev != _OriginalNotify && playerPrev != &HookedNotifyAnimGraph) {
-				logger::warn("[OAR] PlayerCharacter NotifyAnimationGraphImpl differs from Actor "
-					"({:X} vs {:X}) — depth tracking uses Actor original",
-					reinterpret_cast<uintptr_t>(playerPrev),
-					reinterpret_cast<uintptr_t>(_OriginalNotify));
+			auto* playerSlot = reinterpret_cast<NotifyFn*>(playerAnimGraphVtbl.address() + sizeof(void*));
+			if (*playerSlot != &HookedPlayerNotifyAnimGraph) {
+				_OriginalPlayerNotify = reinterpret_cast<NotifyFn>(
+					playerAnimGraphVtbl.write_vfunc(1, &HookedPlayerNotifyAnimGraph));
+			}
+			if (_OriginalPlayerNotify != _OriginalActorNotify &&
+				_OriginalPlayerNotify != &HookedPlayerNotifyAnimGraph) {
+				logger::info("[OAR] PlayerCharacter NotifyAnimationGraphImpl had a third-party hook "
+					"({:X} vs Actor {:X}) — chained through it",
+					reinterpret_cast<uintptr_t>(_OriginalPlayerNotify),
+					reinterpret_cast<uintptr_t>(_OriginalActorNotify));
 			}
 
 			logger::info("[OAR] NotifyAnimationGraphImpl hooks installed (Actor + PlayerCharacter; ActionFireEmpty + reentrancy depth)");
