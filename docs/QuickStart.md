@@ -130,7 +130,7 @@ This is where all the behavior lives.
 | `IsInCombat` | Actor is in combat |
 | `IsSprinting` | Actor is sprinting |
 | `IsInAir` | Actor is airborne |
-| `IsFemale` | Actor is female *(stub)* |
+| `IsFemale` | Actor is female |
 | `IsInPowerArmor` | Actor is in power armor *(stub)* |
 | `IsSneaking` | Actor is sneaking |
 | `IsADS` | Actor is aiming down sights |

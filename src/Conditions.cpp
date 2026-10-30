@@ -187,25 +187,11 @@ void IsRaceCondition::SerializeImpl(nlohmann::json& a_json) const { form.Seriali
 bool IsFemaleCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const
 {
 	if (!a_refr) return false;
-	auto* base = a_refr->data.objectReference;
-	if (!base || base->GetFormType() != RE::ENUM_FORM_ID::kNPC_) return false;
-	// TESActorBaseData inherits at known offset within TESNPC.
-	// The female flag is bit 0 of actorBaseFlags (first field of ACTOR_BASE_DATA struct).
-	// TESNPC layout in FO4: TESForm(0x20) + several components.
-	// TESActorBaseData starts after TESForm+TESFullName+... The flags are accessible via
-	// the TESActorBaseData virtual GetIsGhost() pattern. Instead, use actorData offset.
-	// In CommonLibF4's TESActorBaseData: actorData.actorBaseFlags at the struct start.
-	// Access via BGSKeywordForm/component offset - safer to use raw byte access.
-	// Known working pattern: TESNPC + 0x190 is approximately where actorData.actorBaseFlags lives
-	// But this is fragile. Use the NPCF keyword approach instead:
-	// Most reliable: check if the actor has the NPCF keyword or graph variable
 	auto* actor = a_refr->As<RE::Actor>();
 	if (!actor) return false;
-	// Use graph variable approach: bIsFemale
-	bool isFemale = false;
-	static const RE::BSFixedString kVarName("bIsFemale");
-	actor->GetGraphVariableImplBool(kVarName, isFemale);
-	return isFemale;
+	auto* base = actor->data.objectReference;
+	if (!base || base->GetFormType() != RE::ENUM_FORM_ID::kNPC_) return false;
+	return static_cast<RE::TESNPC*>(base)->IsFemale();
 }
 
 bool IsWeaponDrawnCondition::EvaluateImpl(RE::TESObjectREFR* a_refr, RE::hkbClipGenerator*, const SubMod*) const

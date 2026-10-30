@@ -73,7 +73,7 @@ Conditions that reference a specific form use:
 | **IsForm** | Reference matches a specific form | Form |
 | **IsActorBase** | Actor's NPC_ base record matches | Form |
 | **IsRace** | Actor's race matches | Form |
-| **IsFemale** | Actor is female | (none) |
+| **IsFemale** | Actor is female (reads the base record's `ACTOR_BASE_DATA::kFemale` flag; perspective-independent) | (none) |
 | **IsChild** | Actor is a child | (none) |
 | **IsUnique** | NPC has the Unique flag | (none) |
 | **IsPlayerTeammate** | Actor is a companion/follower | (none) |
