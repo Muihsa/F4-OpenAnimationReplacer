@@ -611,6 +611,12 @@ RE::hkaAnimation* AnimationCache::GetOrBuildRuntimeAnim(const std::string& a_suf
 		peek.unlock();
 		if (wantsMotion) EnsureReferenceFrameVtable();
 	}
+	if (a_gameAnim && !IsBadReadPtr(a_gameAnim, 0x28) &&
+		m_referenceFrameVtable.load(std::memory_order_relaxed) == 0) {
+		const auto motion = *reinterpret_cast<const uintptr_t*>(
+			reinterpret_cast<const uint8_t*>(a_gameAnim) + kExtractedMotionOffset);
+		if (motion != 0) EnsureReferenceFrameVtable();
+	}
 
 	// ===== Shared-lock fast path (perf plan phase 3) =====
 	// This runs per replaced clip per Update. In the steady state the clone
@@ -805,14 +811,9 @@ RE::hkaAnimation* AnimationCache::GetOrBuildRuntimeAnim(const std::string& a_suf
 	// original animation, so any pointer fields reference game memory that gets freed
 	// on weapon switch. We must eliminate all stale references.
 
-	// 1. m_extractedMotion at +0x20. Default: NULL it out — the memcpy'd pointer
-	//    targets the game original's reference frame (freed on weapon switch) and
-	//    most weapon replacements are pose-only anyway. Opt-in (preserve): keep
-	//    OUR file's reference frame when ParsePackfile matched it to a virtual
-	//    fixup the packfile itself names hkaDefaultAnimatedReferenceFrame, the
-	//    game vtable for that class is known, and the whole object plus its
-	//    sample array validate inside the retained fileData (which the cache
-	//    never frees; retired entries carry it along).
+	// 1. m_extractedMotion at +0x20. Prefer the donor's validated reference
+	//    frame when requested; otherwise clone the original frame's metadata
+	//    with neutral samples so the replacement gets no inherited root motion.
 	{
 		uintptr_t preserved = 0;
 		const auto motion = *reinterpret_cast<const uintptr_t*>(ourBytes + kExtractedMotionOffset);
@@ -820,36 +821,80 @@ RE::hkaAnimation* AnimationCache::GetOrBuildRuntimeAnim(const std::string& a_suf
 			const auto rfVtbl = m_referenceFrameVtable.load(std::memory_order_acquire);
 			const bool supported = entry.hasExtractedMotionFixup &&
 				entry.extractedMotionKind == CachedAnimation::VtableFixupKind::kDefaultAnimatedReferenceFrame;
-			// Rate-limited like every other clone-build warn: a permanently failing
-			// donor whose weapon churns clones would otherwise log on every rebuild.
 			static std::atomic<int> s_motionSkipLog{ 0 };
 			const bool logSkip = s_motionSkipLog.load(std::memory_order_relaxed) < 20;
 			if (!supported) {
 				if (logSkip) {
 					s_motionSkipLog.fetch_add(1, std::memory_order_relaxed);
-					logger::warn("[OAR-Motion] '{}': extracted motion skipped — donor object is not an identified hkaDefaultAnimatedReferenceFrame",
+					logger::warn("[OAR-Motion] '{}': donor extracted motion is not an identified hkaDefaultAnimatedReferenceFrame; using the original",
 						entry.filePath);
 				}
 			} else if (rfVtbl == 0) {
 				if (logSkip) {
 					s_motionSkipLog.fetch_add(1, std::memory_order_relaxed);
-					logger::warn("[OAR-Motion] '{}': extracted motion skipped — reference-frame vtable unavailable",
+					logger::warn("[OAR-Motion] '{}': donor reference-frame vtable unavailable; using the original",
 						entry.filePath);
 				}
 			} else if (!ValidateReferenceFrameObject(entry, motion)) {
 				if (logSkip) {
 					s_motionSkipLog.fetch_add(1, std::memory_order_relaxed);
-					logger::warn("[OAR-Motion] '{}': extracted motion skipped — reference-frame object failed validation",
+					logger::warn("[OAR-Motion] '{}': donor reference-frame object failed validation; using the original",
 						entry.filePath);
 				}
 			} else {
-				// Stamp the object's own vtable slot here as well: idempotent with
-				// the fixup patching, and authoritative if the heuristic locator
-				// found the animation outside the fixup table.
 				*reinterpret_cast<uintptr_t*>(motion) = rfVtbl;
 				preserved = motion;
 				OAR_VLOG("[OAR-Motion] Preserved extracted motion for '{}' (reference frame {:X})",
 					entry.filePath, motion);
+			}
+		}
+
+		const auto originalMotion = *reinterpret_cast<const uintptr_t*>(
+			reinterpret_cast<const uint8_t*>(a_gameAnim) + kExtractedMotionOffset);
+		if (!preserved && originalMotion != 0) {
+			const auto rfVtbl = m_referenceFrameVtable.load(std::memory_order_acquire);
+			bool valid = rfVtbl != 0 && !IsBadReadPtr(
+				reinterpret_cast<const void*>(originalMotion), kReferenceFrameObjectSize);
+			if (valid) {
+				valid = *reinterpret_cast<const uintptr_t*>(originalMotion) == rfVtbl;
+			}
+
+			int32_t sampleCount = 0;
+			uintptr_t samples = 0;
+			if (valid) {
+				const auto* object = reinterpret_cast<const uint8_t*>(originalMotion);
+				const auto duration = *reinterpret_cast<const float*>(object + kRefFrameDurationOffset);
+				sampleCount = *reinterpret_cast<const int32_t*>(object + kRefFrameSamplesCountOffset);
+				samples = *reinterpret_cast<const uintptr_t*>(object + kRefFrameSamplesPtrOffset);
+				valid = std::isfinite(duration) && duration >= 0.f && duration <= 600.f &&
+					sampleCount >= 0 && sampleCount <= kMaxReferenceFrameSamples &&
+					(sampleCount == 0 || (samples != 0 &&
+						!IsBadReadPtr(reinterpret_cast<const void*>(samples),
+							static_cast<size_t>(sampleCount) * kReferenceFrameSampleSize)));
+			}
+
+			if (valid) {
+				auto storage = std::make_unique<CachedAnimation::RuntimeClone::ExtractedMotionStorage>();
+				std::memcpy(storage->object.data(), reinterpret_cast<const void*>(originalMotion),
+					kReferenceFrameObjectSize);
+				if (sampleCount > 0) {
+					storage->samples.resize(static_cast<size_t>(sampleCount));
+				}
+				auto* object = storage->object.data();
+				*reinterpret_cast<uintptr_t*>(object + kRefFrameSamplesPtrOffset) =
+					sampleCount > 0 ? reinterpret_cast<uintptr_t>(storage->samples.data()) : 0;
+				*reinterpret_cast<int32_t*>(object + kRefFrameSamplesCountOffset) = sampleCount;
+				*reinterpret_cast<uint32_t*>(object + kRefFrameSamplesCountOffset + 4) =
+					static_cast<uint32_t>(sampleCount) | 0x80000000u;
+				preserved = reinterpret_cast<uintptr_t>(object);
+				newClone.extractedMotion = std::move(storage);
+			} else {
+				static std::atomic<int> s_originalMotionSkipLog{ 0 };
+				if (s_originalMotionSkipLog.fetch_add(1, std::memory_order_relaxed) < 20) {
+					logger::warn("[OAR-Motion] '{}': original extracted motion is unsupported or unreadable; replacement skipped",
+						entry.filePath);
+				}
+				return nullptr;
 			}
 		}
 		*reinterpret_cast<uintptr_t*>(cloneBase + kExtractedMotionOffset) = preserved;
@@ -1045,6 +1090,7 @@ void AnimationCache::RetireSingleCloneLocked(CachedAnimation& a_entry, size_t a_
 		EvictRetiredClonesLocked();
 		RetiredClone rec;
 		rec.buffer = std::move(rc.structBuffer);
+		rec.extractedMotion = std::move(rc.extractedMotion);
 		rec.clonePtr = rc.clone;
 		rec.gameOriginal = rc.gameOriginal;
 		rec.originalDuration = rc.originalDuration;
@@ -1073,12 +1119,17 @@ void AnimationCache::EvictRetiredClonesLocked()
 {
 	constexpr size_t kMaxRetiredClones = 256;
 	constexpr size_t kMaxRetiredBytes = 64u * 1024u * 1024u;
+	auto recordBytes = [](const RetiredClone& a_record) {
+		return a_record.buffer.size() + a_record.backingFileData.size() +
+			(a_record.extractedMotion ? a_record.extractedMotion->object.size() +
+				a_record.extractedMotion->samples.size() * sizeof(CachedAnimation::RuntimeClone::ExtractedMotionStorage::Sample) : 0);
+	};
 	size_t bytes = 0;
-	for (const auto& rc : m_retiredClones) bytes += rc.buffer.size() + rc.backingFileData.size();
+	for (const auto& rc : m_retiredClones) bytes += recordBytes(rc);
 	while (!m_retiredClones.empty() &&
 		(m_retiredClones.size() >= kMaxRetiredClones || bytes > kMaxRetiredBytes)) {
 		auto& front = m_retiredClones.front();
-		bytes -= std::min(bytes, front.buffer.size() + front.backingFileData.size());
+		bytes -= std::min(bytes, recordBytes(front));
 		if (front.clonePtr) m_cloneLookup.erase(front.clonePtr);
 		m_retiredClones.erase(m_retiredClones.begin());
 	}

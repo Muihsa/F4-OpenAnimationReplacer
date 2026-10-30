@@ -94,7 +94,18 @@ public:
 		// original is cheap and each stays valid for the clips playing it.
 		struct RuntimeClone
 		{
+			struct ExtractedMotionStorage
+			{
+				struct alignas(16) Sample
+				{
+					std::array<float, 4> values{};
+				};
+				alignas(16) std::array<uint8_t, 0x58> object{};
+				std::vector<Sample> samples;
+			};
+
 			std::vector<uint8_t> structBuffer;
+			std::unique_ptr<ExtractedMotionStorage> extractedMotion;
 			RE::hkaAnimation* clone{ nullptr };
 			RE::hkaAnimation* gameOriginal{ nullptr };
 			// Identity of the original AT BUILD TIME. The engine can free an
@@ -113,8 +124,8 @@ public:
 		const void* owner{ nullptr };
 		int32_t priority{ 0 };
 
-		// Keep the replacement's extracted-motion reference frame when building
-		// the runtime clone (opt-in via the SubMod flag; see ReplacerMods.h).
+		// Prefer the replacement's extracted-motion reference frame when building
+		// the runtime clone; otherwise use a neutral frame derived from the original.
 		bool preserveExtractedMotion{ false };
 		// The extracted-motion pointer is preserved only when the packfile
 		// identifies it as a supported hkaDefaultAnimatedReferenceFrame. Do not
@@ -253,9 +264,9 @@ private:
 	// Resolve the hkaDefaultAnimatedReferenceFrame vtable from CommonLib's
 	// Address Library (id 587967 — verified stable across OG/NG/AE), and, on
 	// first resolution, stamp already-parsed reference-frame fixups and retire
-	// preserve-enabled clones built before it was known. Resolved lazily, only
-	// for opt-in entries, so pose-only setups never depend on the id. Returns 0
-	// only when the resolved address fails post-resolution validation.
+	// preserve-enabled clones built before it was known. Resolved lazily when a
+	// donor opts in or a game original has extracted motion. Returns 0 only when
+	// the resolved address fails post-resolution validation.
 	uintptr_t EnsureReferenceFrameVtable();
 	static void ComputeSplineOffsets(uint8_t* a_animBytes, CachedAnimation& a_entry);
 
@@ -305,6 +316,7 @@ private:
 	struct RetiredClone
 	{
 		std::vector<uint8_t> buffer;
+		std::unique_ptr<CachedAnimation::RuntimeClone::ExtractedMotionStorage> extractedMotion;
 		RE::hkaAnimation* clonePtr{ nullptr };
 		// Preserve the exact game animation this clone replaced. A weapon switch
 		// can retire the clone while a shared binding still points at it; keeping

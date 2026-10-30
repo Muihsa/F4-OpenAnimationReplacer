@@ -114,10 +114,10 @@ public:
 	bool keepRandomResultsOnLoop{ false };
 	bool shareRandomResults{ false };
 	bool replaceAnnotations{ true };
-	// Preserve the replacement hkaAnimation's extracted-motion reference frame
-	// when OAR builds its runtime clone. Off by default: most weapon-animation
-	// replacements are pose-only and inheriting donor root motion would move the
-	// actor. Only a validated hkaDefaultAnimatedReferenceFrame is ever kept.
+	// Prefer the replacement hkaAnimation's extracted-motion reference frame
+	// when OAR builds its runtime clone. Off by default: the clone uses a
+	// neutral reference frame derived from the game original. Only a validated
+	// hkaDefaultAnimatedReferenceFrame is ever used.
 	bool preserveExtractedMotion{ false };
 	// Annotation suppression: config "suppressAnnotations" accepts true (mute
 	// ALL annotations of the replacement file) or an array of annotation names
