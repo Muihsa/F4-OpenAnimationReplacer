@@ -1425,6 +1425,38 @@ static uint8_t* GetActiveBindingBytes(const RE::hkbClipGenerator* a_clip)
 	return reinterpret_cast<uint8_t*>(a_clip->GetBindingRaw());
 }
 
+static std::shared_mutex s_generateReplacementMutex;
+static std::unordered_map<const RE::hkbClipGenerator*, RE::hkaAnimation*> s_generateReplacementMap;
+static std::mutex s_bindingLocksMutex;
+static std::unordered_map<uint8_t*, std::shared_ptr<std::recursive_mutex>> s_bindingLocks;
+
+static std::shared_ptr<std::recursive_mutex> GetClipBindingLock(const RE::hkbClipGenerator* a_clip)
+{
+	auto* binding = GetActiveBindingBytes(a_clip);
+	if (!binding) return {};
+	std::lock_guard lock(s_bindingLocksMutex);
+	auto& lockPtr = s_bindingLocks[binding];
+	if (!lockPtr) lockPtr = std::make_shared<std::recursive_mutex>();
+	return lockPtr;
+}
+
+static RE::hkaAnimation* GetDesiredGenerateReplacement(const RE::hkbClipGenerator* a_clip)
+{
+	std::shared_lock lock(s_generateReplacementMutex);
+	const auto it = s_generateReplacementMap.find(a_clip);
+	return it != s_generateReplacementMap.end() ? it->second : nullptr;
+}
+
+static void SetDesiredGenerateReplacement(RE::hkbClipGenerator* a_clip, RE::hkaAnimation* a_replacement)
+{
+	std::unique_lock lock(s_generateReplacementMutex);
+	if (a_replacement) {
+		s_generateReplacementMap[a_clip] = a_replacement;
+	} else {
+		s_generateReplacementMap.erase(a_clip);
+	}
+}
+
 // Read the binding's transformTrackToBoneIndices array. Returns nullptr if no
 // binding is currently associated with the clip.
 //   binding+0x18: hkRefPtr<hkaAnimation> animation
@@ -4099,6 +4131,10 @@ void RestoreAllActiveReplacements()
 void ClearClipRuntimeState()
 {
 	ClearIdleStopSuppressionState();
+	{
+		std::unique_lock lock(s_generateReplacementMutex);
+		s_generateReplacementMap.clear();
+	}
 	s_playerGraphPollGeneration.fetch_add(1, std::memory_order_release);
 	{
 		std::lock_guard lock(s_playerGraphPollStateMutex);
@@ -4230,6 +4266,10 @@ static void PerformGlobalDisableRestore()
 	//    clone, and re-install original trigger arrays (validated — same code
 	//    path as the save-load restore).
 	RestoreAllActiveReplacements();
+	{
+		std::unique_lock lock(s_generateReplacementMutex);
+		s_generateReplacementMap.clear();
+	}
 
 	// 2) Drop the trigger backups: the originals are physically back in place.
 	//    Installed filtered arrays are retired (kept alive), not freed — the
@@ -7748,6 +7788,10 @@ namespace
 	void hkbClipGenerator_Activate(RE::hkbClipGenerator* a_this, const RE::hkbContext* a_context)
 	{
 		OAR_PERF_SCOPE(kActivate);
+		auto bindingLock = GetClipBindingLock(a_this);
+		std::unique_lock<std::recursive_mutex> bindingGuard;
+		if (bindingLock) bindingGuard = std::unique_lock<std::recursive_mutex>(*bindingLock);
+		SetDesiredGenerateReplacement(a_this, nullptr);
 		// A generator can be reused for a different graph/actor: forget the memoised owner.
 		{
 			std::unique_lock olock(s_clipOwnerMutex);
@@ -8601,8 +8645,12 @@ namespace
 
 	void hkbClipGenerator_Update(RE::hkbClipGenerator* a_this, const RE::hkbContext* a_context, float a_timestep)
 	{
+		auto bindingLock = GetClipBindingLock(a_this);
+		std::unique_lock<std::recursive_mutex> bindingGuard;
+		if (bindingLock) bindingGuard = std::unique_lock<std::recursive_mutex>(*bindingLock);
 		// Call original Update first — variable bindings must process before any animation swap.
-		if (!SafeCallOriginalUpdate(a_this, a_context, a_timestep)) {
+		const bool updateSucceeded = SafeCallOriginalUpdate(a_this, a_context, a_timestep);
+		if (!updateSucceeded) {
 			static int s_sehLog = 0;
 			if (s_sehLog < 20) {
 				auto** slot = a_this ? a_this->GetAnimationSlot() : nullptr;
@@ -9376,6 +9424,7 @@ namespace
 			}
 
 			if (!candidatesPtr) {
+				SetDesiredGenerateReplacement(a_this, nullptr);
 				// No candidate passed conditions — but our previous replacement may
 				// still be in the animation slot. Restore the original if needed.
 				auto** animSlot = a_this->GetAnimationSlot();
@@ -9955,6 +10004,7 @@ namespace
 			// slot. Instead register the replacement so Generate can sample it per-bone.
 		bool useTrackFilter = winningInfo && winningInfo->parentSubMod &&
 			winningInfo->parentSubMod->trackFilter.enabled && replacement;
+		if (useTrackFilter || !replacement) SetDesiredGenerateReplacement(a_this, nullptr);
 
 		if (orphanAnnotOnly) {
 			// Clone already in the slot from before the save load. Do NOT rebuild
@@ -10252,26 +10302,12 @@ namespace
 				// ---- Standard full-body replacement path ----
 				auto repVtbl = *reinterpret_cast<uintptr_t*>(replacement);
 				if (IsInGameModule(repVtbl)) {
-					if (*animSlot != replacement) {
+					if (GetDesiredGenerateReplacement(a_this) != replacement) {
 						static int s_swapLog = 0;
 						if (s_swapLog < 50) {
-							logger::info("[OAR] Swapping clip '{}' -> replacement (conditions passed, clipGen={:X})",
+							logger::info("[OAR] Generate-scoped replacement '{}' (conditions passed, clipGen={:X})",
 								resolvedSuffix, reinterpret_cast<uintptr_t>(a_this));
 							s_swapLog++;
-						}
-						*animSlot = replacement;
-
-						// Record the un-replace recipe against the SLOT ADDRESS:
-						// the binding this slot lives in survives save loads even
-						// when every clip dies, and this backup is what lets
-						// kPreLoadGame restore the game original into it (see
-						// BindingSlotBackup). originalAnim is guaranteed here: the
-						// clone was just built from it.
-						{
-							std::unique_lock bsLock(s_bindingSlotBackupMutex);
-							auto& bs = s_bindingSlotBackup[animSlot];
-							bs.clone = replacement;
-							bs.original = originalAnim;
 						}
 
 						// When playOnceFullBody is active, keep original triggers intact so the
@@ -10320,6 +10356,8 @@ namespace
 								realPathCopy, ClassifyClipPerspective(a_this, realPathCopy));
 						}
 					}
+
+					SetDesiredGenerateReplacement(a_this, replacement);
 
 					// Start full-body blend-in if SubMod has a blend time configured.
 					// Also register when only a blend-OUT time is set (blend-in 0):
@@ -10801,7 +10839,8 @@ namespace
 			auto tIt = s_triggersBackup.find(a_this);
 			if (tIt != s_triggersBackup.end() && tIt->second.nulled) {
 				float localTime = a_this->GetLocalTime();
-				auto* curAnim = *animSlot;
+				auto* curAnim = GetDesiredGenerateReplacement(a_this);
+				if (!curAnim) curAnim = *animSlot;
 				float duration = 0.0f;
 				if (curAnim && !IsBadReadPtr(curAnim, sizeof(uintptr_t))) {
 					duration = *reinterpret_cast<float*>(
@@ -10869,6 +10908,7 @@ namespace
 			}
 		}
 
+		SetDesiredGenerateReplacement(a_this, nullptr);
 		// NOTE: Do NOT directly erase track filter entries here. The blend-out
 		// logic in HookedActorUpdate handles condition-false deactivation with
 		// a smooth blend. Erasing here would race with and defeat that blend,
@@ -11024,6 +11064,10 @@ namespace
 
 	void hkbClipGenerator_Deactivate(RE::hkbClipGenerator* a_this, const RE::hkbContext* a_context)
 	{
+		auto bindingLock = GetClipBindingLock(a_this);
+		std::unique_lock<std::recursive_mutex> bindingGuard;
+		if (bindingLock) bindingGuard = std::unique_lock<std::recursive_mutex>(*bindingLock);
+		SetDesiredGenerateReplacement(a_this, nullptr);
 		if (a_this) {
 			s_playerGraphPollGeneration.fetch_add(1, std::memory_order_release);
 			ReleaseIdleStopSuppressionClip(a_this);
@@ -11071,27 +11115,8 @@ namespace
 				s_annotIntegrityLastT.erase(a_this);
 			}
 
-			// Restore the ORIGINAL into the shared animation binding before this
-			// clip goes away. The binding belongs to the CHARACTER's binding set
-			// and outlives the clip generator: a clone left here is inherited by
-			// the NEXT generator that activates on the same binding. A FRESH
-			// generator has no animation control at Activate-hook entry (the
-			// control is built inside _Activate from this binding), so BOTH
-			// Activate-side restores are structurally blind to it — the new
-			// control captures the CLONE's duration and the state's
-			// relative-to-end exit then cuts every native annotation past the
-			// clone's end on an un-replaced play (MP7 empty reload dropping
-			// 05_Bolt/06_Shoulder through a fresh clip generator, 2026-08-18;
-			// same family as the Activate catch-all, which still covers RECYCLED
-			// generators whose control survives). Restoring the slot AFTER
-			// _Activate provably does not help — the Update-hook restore ran on
-			// the first frame of that play and the tail was still cut — so the
-			// binding must already be clean when _Activate runs.
-			// Cache-based lookup (not the per-clip backups erased below), with
-			// the same pointer/vtable validation as the Activate catch-all:
-			// during graph teardown (weapon switch) the recorded original may
-			// already be freed, and then the binding is being torn down too, so
-			// leaving the clone is harmless.
+			// Restore the ORIGINAL into the shared animation binding before teardown,
+			// so the next generator using this binding does not inherit the clone.
 			// Runs after the annotation flush above, which needs the clone still
 			// in the slot for its duration read.
 			if (s_gameFullyLoaded.load()) {
@@ -11222,10 +11247,36 @@ namespace
 		Hooks::ClipGeneratorHooks::_Deactivate(a_this, a_context);
 	}
 
+	static void CallOriginalGenerate(RE::hkbClipGenerator* a_this, const RE::hkbContext* a_context,
+		const RE::hkbGeneratorOutput** a_activeChildrenOutput, RE::hkbGeneratorOutput& a_output,
+		float a_timeOffset, RE::hkaAnimation* a_override = nullptr)
+	{
+		auto* binding = GetActiveBindingBytes(a_this);
+		if (!binding) {
+			Hooks::ClipGeneratorHooks::_Generate(a_this, a_context, a_activeChildrenOutput, a_output, a_timeOffset);
+			return;
+		}
+
+		auto bindingLock = GetClipBindingLock(a_this);
+		std::unique_lock<std::recursive_mutex> bindingGuard(*bindingLock);
+		auto** slot = reinterpret_cast<RE::hkaAnimation**>(binding + 0x18);
+		auto* saved = *slot;
+		auto* replacement = a_override ? a_override : GetDesiredGenerateReplacement(a_this);
+		if (replacement) *slot = replacement;
+		struct RestoreSlot
+		{
+			RE::hkaAnimation** slot;
+			RE::hkaAnimation* saved;
+			~RestoreSlot() { *slot = saved; }
+		} restore{ slot, saved };
+
+		Hooks::ClipGeneratorHooks::_Generate(a_this, a_context, a_activeChildrenOutput, a_output, a_timeOffset);
+	}
+
 	void hkbClipGenerator_Generate(RE::hkbClipGenerator* a_this, const RE::hkbContext* a_context,
 		const RE::hkbGeneratorOutput** a_activeChildrenOutput, RE::hkbGeneratorOutput& a_output, float a_timeOffset)
 	{
-		Hooks::ClipGeneratorHooks::_Generate(a_this, a_context, a_activeChildrenOutput, a_output, a_timeOffset);
+		CallOriginalGenerate(a_this, a_context, a_activeChildrenOutput, a_output, a_timeOffset);
 
 		// Perf: OAR's own Generate work only (the engine call above is excluded).
 		OAR_PERF_SCOPE(kGenerate);
@@ -11305,9 +11356,7 @@ namespace
 										RE::hkaAnimation* saved = *animSlot;
 										RE::hkaAnimation* other = fbBlendingIn ? fbOrigAnim : fbRepAnim;
 										if (saved != other) {
-											*animSlot = other;
-											Hooks::ClipGeneratorHooks::_Generate(a_this, a_context, a_activeChildrenOutput, a_output, a_timeOffset);
-											*animSlot = saved;
+											CallOriginalGenerate(a_this, a_context, a_activeChildrenOutput, a_output, a_timeOffset, other);
 
 											// outputPose now has the "other" pose — store as snapshot
 											tl_snapshot.assign(outputPose, outputPose + numBones);
@@ -13441,18 +13490,13 @@ namespace
 			// priming mode, so at ~zero weight just skip it entirely.
 			if (weight <= 0.001f) return;
 
-			RE::hkaAnimation* originalInSlot = *animSlot;
-
 			thread_local std::vector<RE::hkQsTransformRaw> tl_fullBasePose;
 			tl_fullBasePose.resize(numOutputBones);
 			memcpy(tl_fullBasePose.data(), outputPose, numOutputBones * sizeof(RE::hkQsTransformRaw));
 
-			*animSlot = replacement;
 			tfLock.unlock();
-			Hooks::ClipGeneratorHooks::_Generate(a_this, a_context, a_activeChildrenOutput, a_output, a_timeOffset);
+			CallOriginalGenerate(a_this, a_context, a_activeChildrenOutput, a_output, a_timeOffset, replacement);
 			tfLock.lock();
-
-			*animSlot = originalInSlot;
 
 			// Re-find EVERYTHING after the unlock window: other threads may have
 			// erased this state or reallocated the actor's state vector (which
